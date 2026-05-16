@@ -1,15 +1,13 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import FileResponse
+import io
+import numpy as np
+import soundfile as sf
+import pyloudnorm as pyln
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from pedalboard import Pedalboard, Compressor, HighpassFilter, Limiter, Gain, PeakFilter, HighShelfFilter, LowShelfFilter
-from pedalboard.io import AudioFile
-import tempfile
-import os
+from pedalboard import Pedalboard, Compressor, HighpassFilter, HighShelfFilter, LowShelfFilter, Limiter, Gain
 
-# 🛡️ IMPORTA A NOSSA CALCULADORA DE LUFS
-from lufs_radar import enforce_lufs_and_peak
-
-app = FastAPI(title="RQS DSP API v4.0", description="Motor de Masterização e Homologação Comercial")
+app = FastAPI(title="RQS DSP CORE", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,77 +18,75 @@ app.add_middleware(
 )
 
 @app.post("/masterize/parametric/")
-async def masterize_parametric(
-    file: UploadFile = File(...),
-    estilo: str = Form("blue_team"),
-    controle_sibilancia: bool = Form(False),
-    largura_estereo: bool = Form(False),
-    centro_foco: bool = Form(False)
-):
-    print(f"📡 [RECEBIDO] Faixa: {file.filename} | Estilo: {estilo.upper()}")
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_in:
-        tmp_in.write(await file.read())
-        input_path = tmp_in.name
+async def masterize_audio(file: UploadFile = File(...), estilo: str = Form(...)):
+    if not file.filename.lower().endswith('.wav'):
+        raise HTTPException(
+            status_code=400, 
+            detail="⚠️ A RQS exige arquivos .WAV puros."
+        )
 
-    effected_path = input_path.replace(".wav", "_effected.wav")
-    final_output_path = input_path.replace(".wav", "_master_rqs.wav")
+    print(f"📡 [RECEBIDO] Faixa: {file.filename} | Payload: {estilo}")
 
     try:
-        # 🎛️ FASE 1: APLICAR EQ E COMPRESSÃO (Pedalboard)
-        with AudioFile(input_path) as f:
-            audio = f.read(f.frames)
-            samplerate = f.samplerate
+        # 1. Extração do Áudio e Alinhamento de Matriz (O Patch de Matriz)
+        audio_data, sample_rate = sf.read(file.file)
+        audio_data_board = audio_data.T  # Transpõe de (Frames, Canais) para (Canais, Frames)
 
-        if largura_estereo or centro_foco:
-            mid = (audio[0] + audio[1]) / 2.0
-            side = (audio[0] - audio[1]) / 2.0
-            if largura_estereo: side = side * 1.3  
-            if centro_foco: mid = mid * 1.15
-            audio[0] = mid + side
-            audio[1] = mid - side
+        # 2. Desacoplamento do Payload
+        partes = estilo.split('_')
+        estilo_solicitado = partes[0] if len(partes) > 0 else "equilibrado"
+        intensidade_solicitada = partes[1] if len(partes) > 1 else "media"
 
-        plugins = [HighpassFilter(cutoff_frequency_hz=25.0)]
+        # 3. Metas de Volume (LUFS)
+        target_lufs = -14.0 # Padrão Spotify/SoundCloud
+        if intensidade_solicitada == "baixa":
+            target_lufs = -16.0
+        elif intensidade_solicitada == "alta":
+            target_lufs = -9.0 # Volume brutal (EDM/Nu-Metal)
 
-        if controle_sibilancia:
-            plugins.append(PeakFilter(cutoff_frequency_hz=7500.0, gain_db=-3.5, q=1.5))
+        # 4. Roteamento da Pedaleira Analógica (A Mágica DSP)
+        board = Pedalboard()
+        
+        # Reduzimos um pouco o ganho inicial para dar espaço ("Headroom") para os plugins trabalharem
+        board.append(Gain(gain_db=-3.0))
 
-        if estilo == "suno_style":
-            plugins.extend([
-                HighpassFilter(cutoff_frequency_hz=30.0),
-                LowShelfFilter(cutoff_frequency_hz=100.0, gain_db=-1.0),
-                PeakFilter(cutoff_frequency_hz=4000.0, gain_db=-1.5, q=1.0)
-            ])
-            largura_estereo = False 
-        elif estilo == "blue_team":
-            plugins.extend([
-                LowShelfFilter(cutoff_frequency_hz=100.0, gain_db=1.5),
-                HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=1.5),
-                Compressor(threshold_db=-18.0, ratio=2.0, attack_ms=15.0, release_ms=150.0)
-            ])
-        elif estilo == "red_team":
-            plugins.extend([
-                LowShelfFilter(cutoff_frequency_hz=80.0, gain_db=3.0),
-                PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.0),
-                HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.5),
-                Compressor(threshold_db=-22.0, ratio=4.0, attack_ms=5.0, release_ms=80.0)
-            ])
+        if estilo_solicitado == "quente":
+            board.append(LowShelfFilter(cutoff_frequency_hz=120, gain_db=2.5))
+            board.append(HighShelfFilter(cutoff_frequency_hz=8000, gain_db=-1.5))
+            board.append(Compressor(threshold_db=-15, ratio=3.0, attack_ms=5, release_ms=100))
+            
+        elif estilo_solicitado == "aberto":
+            board.append(HighpassFilter(cutoff_frequency_hz=30))
+            board.append(HighShelfFilter(cutoff_frequency_hz=6000, gain_db=3.5))
+            board.append(Compressor(threshold_db=-14, ratio=2.5, attack_ms=10, release_ms=150))
+            
+        else: # Equilibrado
+            board.append(HighpassFilter(cutoff_frequency_hz=20))
+            board.append(Compressor(threshold_db=-16, ratio=2.0, attack_ms=15, release_ms=200))
 
-        board = Pedalboard(plugins)
-        effected = board(audio, samplerate)
+        # 🛡️ BRICKWALL LIMITER: O Escudo contra Distorção Digital
+        board.append(Limiter(threshold_db=-0.3, release_ms=50))
 
-        with AudioFile(effected_path, 'w', samplerate, effected.shape[0]) as f:
-            f.write(effected)
+        # 5. Processamento dos Filtros e Re-alinhamento
+        effected_audio_board = board(audio_data_board, sample_rate)
+        effected_audio = effected_audio_board.T if effected_audio_board.ndim > 1 else effected_audio_board
 
-        print(f"🎛️ [FASE 1] Estilo {estilo.upper()} aplicado.")
+        # 6. Elevação de Intensidade (LUFS)
+        meter = pyln.Meter(sample_rate)
+        current_lufs = meter.integrated_loudness(effected_audio)
+        final_audio = pyln.normalize.loudness(effected_audio, current_lufs, target_lufs)
 
-        # 📊 FASE 2: O RADAR DE LUFS (Normalização e Limiter de Segurança)
-        lufs_final = enforce_lufs_and_peak(effected_path, final_output_path)
-        print(f"✅ [FASE 2] Homologação concluída. Volume estabilizado em: {lufs_final} LUFS.")
+        # 🛡️ HARD CLIP: Garantia absoluta de que a onda não passa do limite do alto-falante
+        final_audio = np.clip(final_audio, -1.0, 1.0)
 
-        return FileResponse(final_output_path, media_type="audio/wav", filename=f"RQS_PRO_{estilo}_{file.filename}")
+        # 7. Empacotamento de Saída
+        buffer = io.BytesIO()
+        sf.write(buffer, final_audio, sample_rate, format='WAV')
+        buffer.seek(0)
+        
+        print("🚀 [SUCESSO] Engenharia acústica finalizada. Retornando carga blindada.")
+        return Response(content=buffer.getvalue(), media_type="audio/wav")
 
-    finally:
-        # Varredura do Lixo de Processamento
-        if os.path.exists(input_path): os.remove(input_path)
-        if os.path.exists(effected_path): os.remove(effected_path)
+    except Exception as e:
+        print(f"💥 [CRASH] Erro interno: {e}")
+        raise HTTPException(status_code=500, detail="Erro no DSP.")
